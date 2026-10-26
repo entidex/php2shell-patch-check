@@ -1,7 +1,9 @@
 name: release
+# Run by hand (Actions → release → Run workflow). Creates the vX.Y.Z release
+# from the script's TOOL_VERSION, attaches the script and checksum, and moves
+# the v1 tag the Action is referenced by.
 on:
-  push:
-    tags: ['v*.*.*']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,6 +19,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ver="$(grep -m1 '^TOOL_VERSION=' php2shell-check.sh | cut -d'"' -f2)"
-          gh release create "$GITHUB_REF_NAME" php2shell-check.sh SHA256SUMS \
+          major="v${ver%%.*}"
+          if gh release view "v$ver" >/dev/null 2>&1; then
+            echo "v$ver already released"; exit 1
+          fi
+          gh release create "v$ver" php2shell-check.sh SHA256SUMS \
+            --target "$GITHUB_SHA" \
             --title "php2shell-check $ver" \
             --notes "Check script $ver. SHA-256: $(cut -d' ' -f1 SHA256SUMS). Same script as https://entidex.com/downloads/php2shell-check.sh."
+          git tag -f "$major" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$major"
