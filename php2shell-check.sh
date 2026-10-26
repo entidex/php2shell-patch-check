@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # php2shell-check: read-only PHP2Shell exposure check for Linux web servers
 # Checks CVE-2026-109618 and CVE-2026-109619 (PHP2Shell, patched 21 Oct 2026).
+# Also reports whether PHP's session upload progress setting is on, which a
+# third, still-unpatched flaw (CVE-2026-115560) needs, and searches web server
+# and PHP logs for signs of the attack (exploitation started 17 Oct 2026).
 #
 # READ-ONLY. This script never installs, updates, restarts, deletes or edits
 # anything (apart from its own temporary report file). It reads package data,
-# process data and file metadata, and runs "php -v" style version commands,
+# process data, file metadata, PHP settings files and log files, and runs
+# "php -v" / "php -i" style commands,
 # but only on PHP programs that root owns and no other user can change. PHP
 # found anywhere else, or inside a container, is listed but never run. Run it only on servers you own or are
 # authorised to manage.
@@ -15,7 +19,7 @@
 #
 # Usage: sudo bash php2shell-check.sh [--json report.json] [--since YYYY-MM-DD]
 #                                      [--roots "/var/www /srv/www"] [--no-files]
-#                                      [--submit CHECK-CODE]
+#                                      [--no-logs] [--submit CHECK-CODE]
 #        bash php2shell-check.sh --status CHECK-CODE
 # Exit codes: 0 = no action needed, 1 = action needed, 2 = could not confirm
 #
@@ -24,19 +28,21 @@
 set -u
 export LC_ALL=C
 
-TOOL_VERSION="1.2.0"
+TOOL_VERSION="1.3.0"
 CVE_A="CVE-2026-109618"
 CVE_B="CVE-2026-109619"
-SINCE="2026-10-19"          # leak was 20 Oct; look a day earlier
+SINCE="2026-10-16"          # attacks seen from 17 Oct; look a day earlier
 JSON_OUT=""
 SCAN_FILES=1
+SCAN_LOGS=1
+LOG_TIME_LIMIT=300          # seconds spent reading logs before stopping
 ROOTS=""
 MAX_LIST=20
 SUBMIT_CODE=""
 STATUS_CODE=""
 ENTIDEX_URL="${ENTIDEX_URL:-https://entidex.com}"
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -44,6 +50,7 @@ while [ $# -gt 0 ]; do
     --since)    SINCE="${2:-}"; shift 2 ;;
     --roots)    ROOTS="${2:-}"; shift 2 ;;
     --no-files) SCAN_FILES=0; shift ;;
+    --no-logs)  SCAN_LOGS=0; shift ;;
     --submit)   SUBMIT_CODE="${2:-}"; shift 2 ;;
     --status)   STATUS_CODE="${2:-}"; shift 2 ;;
     -h|--help)  usage; exit 0 ;;
@@ -52,7 +59,7 @@ while [ $# -gt 0 ]; do
 done
 
 if ! date -d "$SINCE" >/dev/null 2>&1; then
-  echo "--since must be a date like 2026-10-19" >&2; exit 2
+  echo "--since must be a date like 2026-10-16" >&2; exit 2
 fi
 
 # ---------- check code + upload helpers (only used with --submit / --status) ----------
@@ -278,6 +285,44 @@ for p in /usr/lib/apache2/modules/libphp*.so /usr/lib64/httpd/modules/libphp*.so
 done
 shopt -u nullglob
 
+# ---------- CVE-2026-115560: session upload progress (read-only) ----------
+# A third flaw, not yet patched, needs session.upload_progress.enabled on (PHP's
+# default) plus a site that switches session.serialize_handler at run time.
+# Switching upload progress off blocks it. This only reads settings.
+# record: sapi|path|enabled(on/off/unknown)|serialize_handler|ini_dir
+UPLOAD_PROGRESS=()
+ini_token() { # key  <phpinfo text or html on stdin> -> first value after the key
+  sed -E 's/<[^>]+>/ /g' | grep -m1 -E "(^|[[:space:]])$1([[:space:]]|$)" \
+    | awk -v k="$1" '{f=0; for(i=1;i<=NF;i++){ if(f && $i!="=>"){print $i; exit} if($i==k) f=1 }}'
+}
+onoff() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in on|1|true|yes) echo on ;; off|0|false|no|none) echo off ;; *) echo unknown ;; esac; }
+upload_progress_from_bin() { # sapi bin
+  local info en sh dir
+  info="$(timeout 15 "$2" -i 2>/dev/null </dev/null | head -c 2000000)"
+  en="$(onoff "$(printf '%s' "$info" | ini_token session.upload_progress.enabled)")"
+  sh="$(printf '%s' "$info" | ini_token session.serialize_handler)"
+  dir="$(printf '%s' "$info" | sed -E 's/<[^>]+>/ /g' | grep -m1 'Scan this dir for additional .ini files' | grep -oE '/[^[:space:]]+' | head -n1)"
+  UPLOAD_PROGRESS+=("$1|$2|$en|${sh:-unknown}|${dir:--}")
+}
+ini_last() { # key file... -> last value set across the files (php.ini then conf.d order)
+  local k="$1"; shift
+  cat "$@" 2>/dev/null | grep -E "^[[:space:]]*${k}[[:space:]]*=" | tail -n1 \
+    | sed -E "s/^[^=]*=[[:space:]]*//; s/[[:space:]]*[;#].*$//; s/^\"//; s/\"$//"
+}
+upload_progress_from_ini() { # sapi path version (Apache mod_php can't be run; read its settings files)
+  local mm files=() dir="" v en sh
+  mm="$(major_minor "$3")"
+  shopt -s nullglob
+  if [ -d "/etc/php/$mm/apache2" ]; then dir="/etc/php/$mm/apache2/conf.d"; files=("/etc/php/$mm/apache2/php.ini" "$dir"/*.ini)
+  elif [ -f /etc/php.ini ]; then dir="/etc/php.d"; files=(/etc/php.ini /etc/php.d/*.ini); fi
+  shopt -u nullglob
+  if [ ${#files[@]} -eq 0 ]; then UPLOAD_PROGRESS+=("$1|$2|unknown|unknown|-"); return; fi
+  v="$(ini_last 'session\.upload_progress\.enabled' "${files[@]}")"
+  if [ -z "$v" ]; then en="on"; else en="$(onoff "$v")"; fi   # unset means PHP's default: on
+  sh="$(ini_last 'session\.serialize_handler' "${files[@]}")"
+  UPLOAD_PROGRESS+=("$1|$2|$en|${sh:-php}|${dir:--}")
+}
+
 # ---------- 2. assess each runtime ----------
 # record: kind|path|version|package|pkgver|status|reason|running
 RESULTS=()
@@ -330,6 +375,7 @@ for bin in "${CANDIDATES[@]}"; do
   out="$(timeout 10 "$bin" -v 2>/dev/null </dev/null | head -n3)"
   ver="$(printf '%s' "$out" | grep -oE 'PHP v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
   assess "$kind" "$bin" "$ver"
+  case "$kind" in php-fpm|php-cgi|litespeed) upload_progress_from_bin "$kind" "$bin" ;; esac
 done
 for c in "${CONTAINER_PHP[@]}"; do
   RESULTS+=("container|pid ${c%%|*}: ${c#*|}|?|-|-|UNKNOWN|PHP is running inside a container, which this check can't see into. Run the check inside the container, or rebuild its image on a fixed PHP|yes")
@@ -340,6 +386,28 @@ for so in "${MODPHP[@]}"; do
     ver="$(pkg_version "$pkg" | sed -e 's/^[0-9]*://' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
   fi
   assess "apache-mod_php" "$so" "$ver"
+  [ -n "$ver" ] && upload_progress_from_ini "apache-mod_php" "$so" "$ver"
+done
+
+# Per-site switches that turn upload progress off (PHP-FPM pools, Apache vhosts).
+UP_OVERRIDES_OFF=()
+shopt -s nullglob
+for f in /etc/php/*/fpm/pool.d/*.conf /etc/php-fpm.d/*.conf /etc/opt/remi/php*/php-fpm.d/*.conf \
+         /usr/local/etc/php-fpm.d/*.conf /opt/cpanel/ea-php*/root/etc/php-fpm.d/*.conf \
+         /opt/plesk/php/*/etc/php-fpm.d/*.conf /opt/alt/php*/etc/php-fpm.d/*.conf \
+         /etc/apache2/sites-enabled/* /etc/apache2/conf-enabled/* /etc/httpd/conf.d/*.conf /etc/httpd/conf/httpd.conf; do
+  [ -f "$f" ] || continue
+  grep -qiE '^[[:space:]]*php_(admin_)?(flag|value)[[:space:]]*\[?[[:space:]]*session\.upload_progress\.enabled[[:space:]]*\]?[[:space:]]*=?[[:space:]]*"?(off|0|false|no)"?[[:space:]]*$' "$f" 2>/dev/null \
+    && UP_OVERRIDES_OFF+=("$f")
+done
+shopt -u nullglob
+N_UP_ON=0; N_UP_RISKY=0
+for u in "${UPLOAD_PROGRESS[@]}"; do
+  IFS='|' read -r _ _ en sh _ <<<"$u"
+  if [ "$en" = "on" ]; then
+    N_UP_ON=$((N_UP_ON+1))
+    case "$sh" in php_binary|php_serialize) N_UP_RISKY=$((N_UP_RISKY+1)) ;; esac
+  fi
 done
 
 # ---------- 3. pending updates (read-only, uses cached package lists) ----------
@@ -375,7 +443,7 @@ if [ "$SCAN_FILES" -eq 1 ]; then
     while IFS= read -r f; do
       NEW_PHP_COUNT=$((NEW_PHP_COUNT+1))
       if [ "$NEW_PHP_COUNT" -le 5000 ] && grep -qE \
-        'eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13)|assert[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)|\$_(POST|GET|REQUEST|COOKIE)\[[^]]*\][[:space:]]*\(|(system|passthru|shell_exec|proc_open|popen)[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)' \
+        '==SHELLUSER==|==PASSWD==|p2s-rider|eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13)|assert[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)|\$_(POST|GET|REQUEST|COOKIE)\[[^]]*\][[:space:]]*\(|(system|passthru|shell_exec|proc_open|popen)[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)' \
         "$f" 2>/dev/null; then
         SUSPICIOUS+=("$f")
       fi
@@ -385,6 +453,39 @@ if [ "$SCAN_FILES" -eq 1 ]; then
     find /tmp /var/tmp /dev/shm -xdev -maxdepth 2 -type f -iregex "$PHPX" 2>/dev/null | head -n 200)
 fi
 
+# ---------- 4b. web server and PHP logs since $SINCE (read-only) ----------
+# Looks for the PHP2Shell attack's own markers. Most of the attack travels in the
+# request body, which access logs don't keep, so finding nothing here is not
+# proof of no attack; finding something is a strong sign.
+LOG_SHELL=(); LOG_PROBE=(); LOG_CRASH=(); LOG_FILES=0; LOG_TRUNCATED="false"; LOG_DIRS_USED=""
+if [ "$SCAN_LOGS" -eq 1 ]; then
+  shopt -s nullglob
+  LOGDIRS=()
+  for d in /var/log/apache2 /var/log/httpd /var/log/nginx /var/log/php*-fpm* /var/log/php-fpm /var/log/php \
+           /usr/local/apache/logs /usr/local/apache/domlogs /etc/apache2/logs/domlogs \
+           /var/www/vhosts/*/logs /var/www/vhosts/system/*/logs /usr/local/lsws/logs /var/log/litespeed \
+           /opt/cpanel/ea-php*/root/usr/var/log /opt/plesk/php/*/var/log /home/*/logs; do
+    [ -e "$d" ] && LOGDIRS+=("$d")
+  done
+  shopt -u nullglob
+  LOG_DIRS_USED="${LOGDIRS[*]:-}"
+  LOG_START=$SECONDS
+  if [ ${#LOGDIRS[@]} -gt 0 ]; then
+    while IFS= read -r -d '' f; do
+      if [ $((SECONDS - LOG_START)) -ge "$LOG_TIME_LIMIT" ] || [ "$LOG_FILES" -ge 3000 ]; then LOG_TRUNCATED="true"; break; fi
+      LOG_FILES=$((LOG_FILES+1))
+      hits="$(timeout 60 zcat -f -- "$f" 2>/dev/null | grep -a -o -E \
+        '==SHELLUSER==|==PASSWD==|p2s-rider|PHP_SESSION_UPLOAD_PROGRESS|zend_mm_heap corrupted|exit(ed)? on signal 11|signal 11 \(SIGSEGV\)|Segmentation fault' \
+        | sort -u)"
+      [ -z "$hits" ] && continue
+      case "$hits" in *==SHELLUSER==*|*==PASSWD==*) [ ${#LOG_SHELL[@]} -lt 50 ] && LOG_SHELL+=("$f") ;; esac
+      case "$hits" in *p2s-rider*|*PHP_SESSION_UPLOAD_PROGRESS*) [ ${#LOG_PROBE[@]} -lt 50 ] && LOG_PROBE+=("$f") ;; esac
+      case "$hits" in *zend_mm_heap*|*"signal 11"*|*"Segmentation fault"*) [ ${#LOG_CRASH[@]} -lt 50 ] && LOG_CRASH+=("$f") ;; esac
+    done < <(find "${LOGDIRS[@]}" -xdev -type f -newermt "$SINCE" -size -2048M \
+               ! -name '*.xz' ! -name '*.bz2' ! -name '*.zst' ! -name '*.journal' -print0 2>/dev/null)
+  fi
+fi
+
 # ---------- 5. verdict ----------
 N_VULN=0; N_UNK=0; N_OK=0
 for r in "${RESULTS[@]}"; do
@@ -392,8 +493,9 @@ for r in "${RESULTS[@]}"; do
     VULNERABLE) N_VULN=$((N_VULN+1)) ;; UNKNOWN) N_UNK=$((N_UNK+1)) ;; PATCHED) N_OK=$((N_OK+1)) ;;
   esac
 done
-N_IOC=${#SUSPICIOUS[@]}
+N_IOC=$(( ${#SUSPICIOUS[@]} + ${#LOG_SHELL[@]} ))
 N_REVIEW=$(( ${#UPLOAD_PHP[@]} + ${#CORE_CHANGED[@]} + ${#TMP_PHP[@]} ))
+N_LOG_REVIEW=$(( ${#LOG_PROBE[@]} + ${#LOG_CRASH[@]} ))
 
 if [ ${#RESULTS[@]} -eq 0 ] && [ "$CONTAINER_RT" = "true" ]; then
   VERDICT="NOT_CONFIRMED"; EXIT=2
@@ -436,19 +538,49 @@ fi
 
 [ -n "$PENDING" ] && { head1 "PHP updates waiting to install"; say "  $PENDING"; }
 
+list() { local t="$1"; shift; [ $# -eq 0 ] && return; say "  $t: $#"; local i=0 f
+         for f in "$@"; do i=$((i+1)); [ $i -gt $MAX_LIST ] && { say "     … and $(( $# - MAX_LIST )) more"; break; }; say "     $f"; done; }
 if [ "$SCAN_FILES" -eq 1 ]; then
   head1 "Signs of compromise since $SINCE"
   say "  ${D}Web roots scanned: ${ROOTS_USED:-none found}${N}"
   say "  PHP files created or changed since $SINCE: $NEW_PHP_COUNT"
-  list() { local t="$1"; shift; [ $# -eq 0 ] && return; say "  $t: $#"; local i=0 f
-           for f in "$@"; do i=$((i+1)); [ $i -gt $MAX_LIST ] && { say "     … and $(( $# - MAX_LIST )) more"; break; }; say "     $f"; done; }
   list "${R}Files matching web-shell patterns${N}" "${SUSPICIOUS[@]}"
   list "${Y}PHP files in temp folders (review)${N}" "${TMP_PHP[@]}"
   list "${Y}PHP files inside WordPress uploads (review)${N}" "${UPLOAD_PHP[@]}"
   list "${Y}WordPress core files changed (normal after an update; review)${N}" "${CORE_CHANGED[@]}"
-  [ $N_IOC -eq 0 ] && [ $N_REVIEW -gt 0 ] && [ "$VERDICT" != "ACTION_NEEDED" ] && say "  ${Y}Nothing matched web-shell patterns, but review the files listed above.${N}"
-  [ $N_IOC -eq 0 ] && [ $N_REVIEW -eq 0 ] && say "  ${G}Nothing suspicious found in file checks.${N}"
+  [ ${#SUSPICIOUS[@]} -eq 0 ] && [ $N_REVIEW -gt 0 ] && [ "$VERDICT" != "ACTION_NEEDED" ] && say "  ${Y}Nothing matched web-shell patterns, but review the files listed above.${N}"
+  [ ${#SUSPICIOUS[@]} -eq 0 ] && [ $N_REVIEW -eq 0 ] && say "  ${G}Nothing suspicious found in file checks.${N}"
   say "  ${D}Also check WordPress admin users, e.g.: wp user list --role=administrator --fields=user_login,user_registered${N}"
+fi
+
+if [ "$SCAN_LOGS" -eq 1 ]; then
+  head1 "Web server and PHP logs since $SINCE"
+  say "  ${D}Log folders: ${LOG_DIRS_USED:-none found} · files read: $LOG_FILES${N}"
+  [ "$LOG_TRUNCATED" = "true" ] && say "  ${Y}Stopped early (time or file limit), so not every log was read.${N}"
+  list "${R}Attack output markers (==SHELLUSER== / ==PASSWD==)${N}" "${LOG_SHELL[@]}"
+  list "${Y}Probe markers (p2s-rider / PHP_SESSION_UPLOAD_PROGRESS) (review)${N}" "${LOG_PROBE[@]}"
+  list "${Y}PHP crashes (heap corruption / segfault) (review)${N}" "${LOG_CRASH[@]}"
+  if [ ${#LOG_SHELL[@]} -eq 0 ] && [ $N_LOG_REVIEW -eq 0 ]; then
+    say "  ${G}No attack markers found in the logs.${N} ${D}Most of the attack is in the request body, which logs don't keep, so this is not proof on its own.${N}"
+  fi
+fi
+
+if [ ${#UPLOAD_PROGRESS[@]} -gt 0 ]; then
+  head1 "Third flaw (CVE-2026-115560, not yet patched)"
+  for u in "${UPLOAD_PROGRESS[@]}"; do
+    IFS='|' read -r sapi path en sh dir <<<"$u"
+    case "$en" in on) c=$Y ;; off) c=$G ;; *) c=$D ;; esac
+    say "  ${c}upload progress $en${N}  $sapi ${D}$path · serialize_handler $sh${N}"
+  done
+  [ ${#UP_OVERRIDES_OFF[@]} -gt 0 ] && say "  ${D}Switched off per site in: ${UP_OVERRIDES_OFF[*]}${N}"
+  if [ $N_UP_ON -gt 0 ]; then
+    say "  ${Y}Session upload progress is on. Until PHP ships a fix, add this line to php.ini (or a conf.d file) and restart PHP:${N}"
+    say "      session.upload_progress.enabled = 0"
+    say "  ${D}It can't be set with ini_set(). Side effect: server-side upload progress bars stop updating.${N}"
+    [ $N_UP_RISKY -gt 0 ] && say "  ${Y}serialize_handler is set to php_binary or php_serialize, which this flaw relies on. Switch upload progress off now.${N}"
+  else
+    say "  ${G}Session upload progress is off on every web runtime checked.${N}"
+  fi
 fi
 
 head1 "Result"
@@ -460,9 +592,12 @@ case "$VERDICT" in
     [ $N_VULN -gt 0 ] && say "  · Update PHP to 8.5.12, 8.4.27, 8.3.36 or 8.2.35 (or your distro's patched package)."
     [ ${#STALE[@]} -gt 0 ] && say "  · Restart PHP-FPM / LiteSpeed / Apache so the patched code is live."
     [ ${#UNTRUSTED[@]} -gt 0 ] && say "  · PHP programs found in places other users can change. They were not run. Treat the server as possibly compromised and get help."
-    [ $N_IOC -gt 0 ] && say "  · Files matching web-shell patterns found. Treat the server as possibly compromised and get help before deleting anything."
+    [ ${#SUSPICIOUS[@]} -gt 0 ] && say "  · Files matching web-shell patterns found. Treat the server as possibly compromised and get help before deleting anything."
+    [ ${#LOG_SHELL[@]} -gt 0 ] && say "  · The logs show the attack's output markers. Treat the server as possibly compromised and get help before deleting anything."
     say "  · UK guidance (NCSC): update internet-facing PHP now, or take it offline until you can." ;;
 esac
+[ "$VERDICT" != "ACTION_NEEDED" ] && [ $N_LOG_REVIEW -gt 0 ] && say "  ${Y}Review the log entries listed above: they can mean the server was probed or attacked before it was patched.${N}"
+[ $N_UP_ON -gt 0 ] && say "  ${Y}Also: switch off session upload progress (see \"Third flaw\" above) until PHP fixes CVE-2026-115560.${N}"
 
 # ---------- 7. JSON report ----------
 if [ -n "$JSON_OUT" ]; then
@@ -490,6 +625,20 @@ if [ -n "$JSON_OUT" ]; then
     printf ',"temp_php":'; jarr "${TMP_PHP[@]}"
     printf ',"uploads_php":'; jarr "${UPLOAD_PHP[@]}"
     printf ',"wp_core_changed":'; jarr "${CORE_CHANGED[@]}"
+    printf '},"logs":{"scanned":%s,"dirs":"%s","files_read":%d,"truncated":%s,' \
+      "$([ $SCAN_LOGS -eq 1 ] && echo true || echo false)" "$(json_esc "$LOG_DIRS_USED")" "$LOG_FILES" "$LOG_TRUNCATED"
+    printf '"shell_markers":'; jarr "${LOG_SHELL[@]}"
+    printf ',"probes":'; jarr "${LOG_PROBE[@]}"
+    printf ',"crashes":'; jarr "${LOG_CRASH[@]}"
+    printf '},"cve_2026_115560":{"runtimes":['
+    first=1
+    for u in "${UPLOAD_PROGRESS[@]}"; do
+      IFS='|' read -r sapi path en sh dir <<<"$u"
+      [ $first -eq 0 ] && printf ','; first=0
+      printf '{"sapi":"%s","path":"%s","upload_progress":"%s","serialize_handler":"%s","ini_dir":"%s"}' \
+        "$sapi" "$(json_esc "$path")" "$en" "$(json_esc "$sh")" "$(json_esc "$dir")"
+    done
+    printf '],"overrides_off":'; jarr "${UP_OVERRIDES_OFF[@]}"
     printf '}}\n'
   } > "$JSON_OUT"
   sum="$(sha256sum "$JSON_OUT" 2>/dev/null | cut -d' ' -f1)"
