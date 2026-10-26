@@ -1,0 +1,67 @@
+name: PHP2Shell check
+description: Read-only check that the PHP on this runner or image includes the PHP2Shell fix (CVE-2026-109618, CVE-2026-109619).
+author: Entidex
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  fail-on:
+    description: "Fail the job on: action-needed (default), not-confirmed (also fails on action-needed), or never."
+    required: false
+    default: action-needed
+  scan-files:
+    description: "Also scan web folders for signs of attack (true/false)."
+    required: false
+    default: "false"
+
+outputs:
+  verdict:
+    description: PATCHED, NO_PHP_FOUND, NOT_CONFIRMED or ACTION_NEEDED.
+    value: ${{ steps.check.outputs.verdict }}
+  report:
+    description: Path to the JSON report.
+    value: ${{ steps.check.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        FAIL_ON: ${{ inputs.fail-on }}
+        SCAN_FILES: ${{ inputs.scan-files }}
+        SCRIPT: ${{ github.action_path }}/php2shell-check.sh
+      run: |
+        set -u
+        case "$FAIL_ON" in action-needed|not-confirmed|never) ;; *) echo "::error::fail-on must be action-needed, not-confirmed or never"; exit 2 ;; esac
+        report="${RUNNER_TEMP:-/tmp}/php2shell-report.json"
+        args=(--json "$report")
+        [ "$SCAN_FILES" = "true" ] || args+=(--no-files)
+        if [ "$(id -u)" -eq 0 ]; then run=(bash "$SCRIPT"); elif command -v sudo >/dev/null 2>&1; then run=(sudo -n bash "$SCRIPT"); else run=(bash "$SCRIPT"); fi
+        set +e
+        "${run[@]}" "${args[@]}"
+        code=$?
+        set -e
+        [ -f "$report" ] && [ ! -r "$report" ] && sudo -n chmod a+r "$report" 2>/dev/null
+        verdict="$(grep -o '"verdict":"[A-Z_]*"' "$report" 2>/dev/null | head -n1 | cut -d'"' -f4)"
+        verdict="${verdict:-NOT_CONFIRMED}"
+        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        {
+          echo "### PHP2Shell check: $verdict"
+          echo
+          case "$verdict" in
+            PATCHED) echo "Every PHP runtime found includes the fix." ;;
+            NO_PHP_FOUND) echo "No PHP found." ;;
+            NOT_CONFIRMED) echo "Some runtimes couldn't be confirmed as fixed. See the job log." ;;
+            ACTION_NEEDED) echo "Action needed: update or restart PHP. See the job log for details." ;;
+          esac
+          echo
+          echo "Need it fixed or a signed result? [entidex.com/php2shell](https://entidex.com/php2shell)"
+        } >> "$GITHUB_STEP_SUMMARY"
+        case "$FAIL_ON" in
+          never) exit 0 ;;
+          action-needed) [ "$code" -eq 1 ] && exit 1 || exit 0 ;;
+          not-confirmed) [ "$code" -ne 0 ] && exit 1 || exit 0 ;;
+        esac

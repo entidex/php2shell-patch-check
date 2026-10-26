@@ -1,0 +1,36 @@
+name: test
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  checksum:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SHA256SUMS matches the script
+        run: sha256sum -c SHA256SUMS
+      - name: Same bytes as the copy served at entidex.com
+        run: |
+          curl -fsSL https://entidex.com/downloads/php2shell-check.sh -o served.sh
+          if ! cmp -s served.sh php2shell-check.sh; then
+            echo "::error::php2shell-check.sh differs from https://entidex.com/downloads/php2shell-check.sh. Publish a new release."
+            exit 1
+          fi
+
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: run
+        uses: ./
+        with:
+          fail-on: never
+      - name: Verdict is set
+        run: |
+          echo "verdict: ${{ steps.run.outputs.verdict }}"
+          case "${{ steps.run.outputs.verdict }}" in PATCHED|NO_PHP_FOUND|NOT_CONFIRMED|ACTION_NEEDED) ;; *) exit 1 ;; esac
+          test -s "${{ steps.run.outputs.report }}"
